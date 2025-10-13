@@ -1,0 +1,14 @@
+{
+  "agent_name": "Automat",
+  "log_level": "INFO",
+  "default_interval": 60,
+  "max_concurrent_tasks": 5,
+  "tasks": [
+    {
+      "name": "example_task",
+      "description": "An example automated task",
+      "enabled": true,
+      "interval": 0
+    }
+  ]
+}
