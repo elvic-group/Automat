@@ -1,0 +1,245 @@
+name: Kultur Support Agent
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC (weekly)
+  workflow_dispatch:
+    inputs:
+      run_scope:
+        description: 'Scope override (e.g., culture, sport, tech)'
+        required: false
+        default: 'culture-no'
+      email_recipients:
+        description: 'Comma-separated list of recipients'
+        required: false
+        default: ''
+      sheet_title_suffix:
+        description: 'Optional suffix for sheet title'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  SECTOR: culture-no
+  PROMPT_DATA_COLLECTION: |
+    List all active support and funding schemes for the cultural sector in Norway, with key info:
+    - Scheme name
+    - Short description
+    - Who can apply
+    - Funding amount/range
+    - Application deadlines
+    - Responsible organization/administrator
+    - Url/source link
+    Include state, regional, municipal, and private schemes (Kulturrådet, fylker, kommuner, Lotteri- og stiftelsestilsynet, stiftelser, m.m.). Cover categories like: music, visual arts, theatre, literature, festivals, cultural heritage, volunteering, organizers, youth/children, diversity/inclusion.
+  PROMPT_FORMATTING: |
+    Format all retrieved schemes for the cultural sector as spreadsheet rows with the following columns: Name, Description, Target Group, Funding Amount, Application Deadline, Responsible Organization, Source Link. Output as CSV with header, using commas, and escape quotes as needed.
+  PROMPT_SUMMARY: |
+    Create an email summary for stakeholders covering:
+    - Number of total and new support schemes for culture
+    - Upcoming application deadlines (next 30 days)
+    - Main/high-value schemes (>500,000 NOK)
+    - Special highlights (new schemes, categories, resources)
+    Include a link to the Google Sheet and attach the CSV if available.
+
+jobs:
+  kultur_support_agent:
+    name: Weekly Cultural Support Schemes Aggregation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install openai pandas gspread google-auth google-auth-oauthlib google-auth-httplib2 pytz
+
+      - name: Resolve runtime inputs
+        id: inputs
+        run: |
+          echo "run_scope=${{ github.event.inputs.run_scope || env.SECTOR }}" >> $GITHUB_OUTPUT
+          echo "sheet_title_suffix=${{ github.event.inputs.sheet_title_suffix }}" >> $GITHUB_OUTPUT
+          echo "email_recipients=${{ github.event.inputs.email_recipients }}" >> $GITHUB_OUTPUT
+
+      - name: Run data collection agent
+        id: agent
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os, json, datetime
+          from openai import OpenAI
+          client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+
+          today = datetime.datetime.utcnow().strftime('%d.%m.%Y')
+          collection_prompt = os.environ['PROMPT_DATA_COLLECTION']
+          formatting_prompt = os.environ['PROMPT_FORMATTING']
+
+          system = (
+            "You are a diligent research assistant that gathers current, public information from authoritative Norwegian sources. "
+            "Return only verifiable, citable results with working URLs."
+          )
+
+          user = f"{collection_prompt}\n\nReturn the results in structured bullet points ready for tabular formatting."
+
+          # Collect schemes
+          resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+              {"role": "system", "content": system},
+              {"role": "user", "content": user}
+            ],
+            temperature=0.2
+          )
+          collected = resp.choices[0].message.content
+
+          # Ask model to format as CSV
+          resp2 = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+              {"role": "system", "content": "You convert structured lists into strict CSV."},
+              {"role": "user", "content": formatting_prompt + "\n\nHere are the collected items:\n" + collected}
+            ],
+            temperature=0.0
+          )
+          csv_data = resp2.choices[0].message.content.strip()
+
+          # Write CSV to file
+          csv_path = "data/kultur_stotteordninger.csv"
+          os.makedirs("data", exist_ok=True)
+          with open(csv_path, 'w', encoding='utf-8') as f:
+              f.write(csv_data)
+
+          print(f"CSV_PATH={csv_path}")
+          PY
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kultur_stotteordninger_csv
+          path: data/kultur_stotteordninger.csv
+
+      - name: Create/Update Google Sheet
+        id: sheet
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - << 'PY'
+          import os, json, csv, datetime
+          import gspread
+          from google.oauth2.service_account import Credentials
+
+          sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+          if not sa_json:
+              print('::warning::GOOGLE_SERVICE_ACCOUNT_JSON not configured, skipping Sheets step')
+              print('SHEET_URL=')
+              raise SystemExit(0)
+
+          creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=[
+              'https://www.googleapis.com/auth/spreadsheets',
+              'https://www.googleapis.com/auth/drive'
+          ])
+          gc = gspread.authorize(creds)
+
+          date_str = datetime.datetime.utcnow().strftime('%d.%m.%Y')
+          suffix = os.environ.get('sheet_title_suffix','').strip()
+          title = f"Støtteordninger Kultur Norge ({date_str})" + (f" - {suffix}" if suffix else '')
+
+          # Create or reuse by title
+          try:
+              sh = next((s for s in gc.openall() if s.title == title), None)
+              if not sh:
+                  sh = gc.create(title)
+          except Exception:
+              sh = gc.create(title)
+
+          # If service account needs to share: optional, skip if no DRIVE perms
+          try:
+              # No-op: repository owners should share manually if needed
+              pass
+          except Exception:
+              pass
+
+          # Write CSV to first worksheet
+          ws = sh.sheet1
+          ws.clear()
+          with open('data/kultur_stotteordninger.csv', encoding='utf-8') as f:
+              reader = csv.reader(f)
+              rows = list(reader)
+          ws.update('A1', rows)
+
+          print(f"SHEET_URL={sh.url}")
+          PY
+
+      - name: Generate summary email body
+        id: summary
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os, datetime
+          from openai import OpenAI
+          client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+
+          with open('data/kultur_stotteordninger.csv', encoding='utf-8') as f:
+              csv_text = f.read()
+
+          sheet_url = os.environ.get('SHEET_URL', '')
+          prompt = os.environ['PROMPT_SUMMARY']
+
+          sys = "You write concise, actionable email summaries for stakeholders. Keep it under 250 words."
+          user = f"{prompt}\n\nGoogle Sheet: {sheet_url}\n\nCSV data (truncated if needed):\n{csv_text[:12000]}"
+
+          resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+            temperature=0.3
+          )
+          body = resp.choices[0].message.content
+
+          with open('data/summary_email.md', 'w', encoding='utf-8') as f:
+              f.write(body)
+          PY
+
+      - name: Send email with report and sheet link
+        if: ${{ inputs.email_recipients != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Kultur – Støtteordninger: ukentlig rapport"
+          to: ${{ inputs.email_recipients }}
+          from: ${{ secrets.SMTP_FROM }}
+          content_type: text/html
+          html_body: |
+            ${{ steps.summary.outputs.body || 'Se vedlagt CSV og Google Sheet-link.' }}
+          attachments: |
+            data/kultur_stotteordninger.csv
+
+      - name: Commit CSV back to repo (optional)
+        if: ${{ always() }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add data/kultur_stotteordninger.csv || true
+          git commit -m "chore: update kultur støtteordninger CSV" || echo "No changes to commit"
+          git push || true
+
+# Documentation of steps:
+# 1) Trigger: schedule weekly + manual dispatch with inputs
+# 2) Data collection: OpenAI agent prompted with domain-specific instructions
+# 3) Structuring: model converts to strict CSV, saved and uploaded as artifact
+# 4) Google Sheet: creates/updates a sheet titled with current date, writes CSV
+# 5) Summary: generates concise email summary with counts, deadlines, highlights
+# 6) Email: sends report with CSV attachment and sheet link (via secrets-configured SMTP)
+# 7) Commit: stores latest CSV in repo for traceability
